@@ -1,0 +1,21 @@
+# Python cache and environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+venv/
+
+# Environment files
+.env
+.env.*
+*.log
+
+# VS Code configs
+.vscode/
+!.vscode/settings.json  # allow only this file to be committed
+
+# OS-specific
+.DS_Store
+Thumbs.db
