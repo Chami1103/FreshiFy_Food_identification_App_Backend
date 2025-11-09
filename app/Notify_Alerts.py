@@ -1,8 +1,5 @@
-# File: Notify_Alerts.py
-# Path at repo root: Notify_Alerts.py
-
 """
-notify_alerts.py — Notification / Calendar / Blog / Calculator Backend (configurable port)
+Notify_Alerts.py — Notification / Calendar / Blog / Calculator Backend (configurable port)
 Uses FreshiFyDB for persistence and prefers waitress if installed.
 """
 
@@ -23,14 +20,18 @@ try:
 except Exception:
     waitress_serve = None
 
+# ------------------------------------------------------------
+# Setup Environment & Logging
+# ------------------------------------------------------------
 load_dotenv()
 
 LOG_DIR = os.path.join(os.getcwd(), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
 logging.basicConfig(
-    filename=os.path.join(LOG_DIR, "notify.log"), 
-    level=os.getenv("LOG_LEVEL", "INFO"), 
+    filename=os.path.join(LOG_DIR, "notify.log"),
+    level=os.getenv("LOG_LEVEL", "INFO"),
     format=LOG_FORMAT
 )
 _console = logging.StreamHandler()
@@ -39,21 +40,31 @@ _console.setFormatter(logging.Formatter(LOG_FORMAT))
 logging.getLogger().addHandler(_console)
 logger = logging.getLogger("notify_alerts")
 
+# ------------------------------------------------------------
+# Flask App Setup
+# ------------------------------------------------------------
 app = Flask(__name__, static_folder=None)
 origins_env = (os.getenv("CORS_ORIGINS") or "").strip()
 origins = [o.strip() for o in origins_env.split(",") if o.strip()] or ["*"]
 CORS(
-    app, 
-    resources={r"/*": {"origins": origins}}, 
+    app,
+    resources={r"/*": {"origins": origins}},
     supports_credentials=True,
-    allow_headers=["Content-Type", "Authorization", "X-Requested-With"], 
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
     methods=["GET", "POST", "DELETE", "OPTIONS"]
 )
 
+# ------------------------------------------------------------
+# DB Setup
+# ------------------------------------------------------------
 cfg = FreshifyConfig()
 db = FreshiFyDB(cfg)
 logger.info("DB wrapper initialized (connected=%s)", db.db is not None)
 
+
+# ------------------------------------------------------------
+# Helper Functions & Error Classes
+# ------------------------------------------------------------
 def _json_req(required: Optional[List[str]] = None) -> Dict[str, Any]:
     body = request.get_json(silent=True) or {}
     if required:
@@ -62,27 +73,36 @@ def _json_req(required: Optional[List[str]] = None) -> Dict[str, Any]:
             raise BadRequestError(f"Missing required fields: {', '.join(missing)}")
     return body
 
+
 class BadRequestError(Exception):
     pass
 
+
 class NotFoundError(Exception):
     pass
+
 
 @app.errorhandler(BadRequestError)
 def handle_bad_request(e):
     logger.warning("BadRequest: %s %s", e, request.path)
     return jsonify({"ok": False, "error": str(e)}), 400
 
+
 @app.errorhandler(NotFoundError)
 def handle_not_found(e):
     logger.warning("NotFound: %s %s", e, request.path)
     return jsonify({"ok": False, "error": str(e)}), 404
+
 
 @app.errorhandler(Exception)
 def handle_exception(e):
     logger.exception("Unhandled exception while processing %s %s: %s", request.method, request.path, e)
     return jsonify({"ok": False, "error": "internal_server_error"}), 500
 
+
+# ------------------------------------------------------------
+# Health Endpoint
+# ------------------------------------------------------------
 @app.get("/health")
 def health():
     db_ok = bool(db.db)
@@ -93,24 +113,32 @@ def health():
         "db_connected": db_ok,
     }), 200
 
-# ==================== NOTIFICATIONS ====================
+
+# ------------------------------------------------------------
+# Notifications
+# ------------------------------------------------------------
 @app.get("/notifications")
 def list_notifications():
     limit = min(int(request.args.get("limit", 50)), 500)
     out = []
     try:
-        cur = db.notifications.find({"user": cfg.current_user}).sort("createdAt", -1).limit(limit) if db.notifications else []
+        if db.notifications is None:
+            logger.warning("[NOTIFY] Notifications collection is None")
+            return jsonify([]), 200
+
+        cur = db.notifications.find({"user": cfg.current_user}).sort("createdAt", -1).limit(limit)
         for d in cur:
             ca = d.get("createdAt")
             out.append({
-                "id": str(d.get("_id")), 
-                "message": d.get("message"), 
+                "id": str(d.get("_id")),
+                "message": d.get("message"),
                 "createdAt": ca.isoformat() if hasattr(ca, "isoformat") else ca
             })
     except Exception as e:
         logger.warning("[NOTIFY] Error listing notifications: %s", e)
         raise
     return jsonify(out), 200
+
 
 @app.post("/notify")
 def add_notification():
@@ -126,7 +154,53 @@ def add_notification():
         logger.exception("[NOTIFY] Insert error")
         raise
 
-# ==================== CALENDAR ====================
+
+# ------------------------------------------------------------
+# Thoughts (Floating notes from the mobile client)
+# ------------------------------------------------------------
+@app.post("/thoughts/add")
+def thoughts_add():
+    """
+    Accepts JSON: { "text": "Tomorrow eat fried rice" }
+    Stores the note in the 'thoughts' collection.
+    """
+    body = _json_req(required=["text"])
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise BadRequestError("text is required")
+    # optional length/word guard server-side (app also enforces)
+    words = len(text.split())
+    if words > 60:
+        # allow more on server but warn client ideally; here we cap and store first 60 words
+        text = " ".join(text.split()[:60])
+    try:
+        tid = db.add_thought(text=text, user=cfg.current_user)
+        logger.info("[THOUGHT] Added thought id=%s user=%s len=%d", tid, cfg.current_user, len(text))
+        return jsonify({"ok": True, "id": tid}), 201
+    except Exception:
+        logger.exception("[THOUGHT] Insert error")
+        raise
+
+
+@app.get("/thoughts/list")
+def thoughts_list():
+    """
+    Query params:
+      - limit (optional)
+    Returns: latest thoughts for current user.
+    """
+    limit = min(int(request.args.get("limit", 50)), 500)
+    try:
+        items = db.list_thoughts(user=cfg.current_user, limit=limit)
+        return jsonify(items), 200
+    except Exception:
+        logger.exception("[THOUGHT] List error")
+        raise
+
+
+# ------------------------------------------------------------
+# Calendar
+# ------------------------------------------------------------
 @app.post("/calendar/add")
 def calendar_add():
     body = _json_req(required=["title", "start"])
@@ -142,6 +216,7 @@ def calendar_add():
         logger.exception("[CALENDAR] Add error")
         raise
 
+
 @app.get("/calendar/events")
 def calendar_events():
     start_from = request.args.get("from") or None
@@ -154,6 +229,7 @@ def calendar_events():
         logger.warning("[CALENDAR] List error")
         raise
 
+
 @app.delete("/calendar/delete/<event_id>")
 def calendar_delete(event_id: str):
     try:
@@ -164,7 +240,10 @@ def calendar_delete(event_id: str):
         logger.exception("[CALENDAR] Delete error")
         raise
 
-# ==================== BLOGS ====================
+
+# ------------------------------------------------------------
+# Blogs
+# ------------------------------------------------------------
 @app.post("/blogs/add")
 def blogs_add():
     body = _json_req(required=["title", "content"])
@@ -175,7 +254,7 @@ def blogs_add():
     readTime = (body.get("readTime") or "").strip() or None
     tags = body.get("tags") or []
     image = (body.get("image") or "").strip() or None
-    
+
     try:
         bid = db.add_blog(
             title=title,
@@ -192,6 +271,7 @@ def blogs_add():
         logger.exception("[BLOGS] Add error")
         raise
 
+
 @app.get("/blogs/list")
 def blogs_list():
     limit = min(int(request.args.get("limit", 50)), 500)
@@ -201,6 +281,7 @@ def blogs_list():
     except Exception:
         logger.warning("[BLOGS] List error")
         raise
+
 
 @app.get("/blogs/<blog_id>")
 def blogs_get(blog_id: str):
@@ -215,6 +296,7 @@ def blogs_get(blog_id: str):
         logger.exception("[BLOGS] Get error")
         raise
 
+
 @app.delete("/blogs/delete/<blog_id>")
 def blogs_delete(blog_id: str):
     try:
@@ -225,7 +307,10 @@ def blogs_delete(blog_id: str):
         logger.exception("[BLOGS] Delete error")
         raise
 
-# ==================== CALCULATOR ====================
+
+# ------------------------------------------------------------
+# Calculator
+# ------------------------------------------------------------
 @app.post("/calculator/add")
 def calculator_add():
     body = _json_req(required=["food", "value", "kind", "date"])
@@ -233,10 +318,10 @@ def calculator_add():
     value = float(body.get("value", 0))
     kind = (body.get("kind") or "entry").strip()
     date_iso = (body.get("date") or "").strip()
-    
+
     if kind not in ("entry", "bonus"):
         raise BadRequestError("kind must be 'entry' or 'bonus'")
-    
+
     try:
         rid = db.add_calc_record(
             user=cfg.current_user,
@@ -251,6 +336,7 @@ def calculator_add():
         logger.exception("[CALC] Add error")
         raise
 
+
 @app.get("/calculator/summary")
 def calculator_summary():
     try:
@@ -260,7 +346,10 @@ def calculator_summary():
         logger.warning("[CALC] Summary error")
         raise
 
-# ==================== SHUTDOWN HANDLING ====================
+
+# ------------------------------------------------------------
+# Graceful Shutdown Handling
+# ------------------------------------------------------------
 _shutdown_requested = threading.Event()
 
 def _graceful_stop(signum, frame):
@@ -271,13 +360,17 @@ signal.signal(signal.SIGINT, _graceful_stop)
 with suppress(AttributeError):
     signal.signal(signal.SIGTERM, _graceful_stop)
 
+
+# ------------------------------------------------------------
+# Run Server
+# ------------------------------------------------------------
 def run_server():
     port = int(os.getenv("NOTIFY_PORT", "5002"))
     host = os.getenv("NOTIFY_HOST", "0.0.0.0")
     logger.info("========== Starting FreshiFy Notify Backend ==========")
     logger.info("Serving on http://%s:%s (CORS origins=%s)", host, port, origins)
     use_waitress = os.getenv("USE_WAITRESS", "true").lower() in ("1", "true", "yes")
-    
+
     if waitress_serve and use_waitress:
         logger.info("Using waitress WSGI server")
         try:
@@ -288,6 +381,7 @@ def run_server():
     else:
         logger.warning("waitress not used — running Flask dev server (not for production)")
         app.run(host=host, port=port, debug=False)
+
 
 if __name__ == "__main__":
     try:

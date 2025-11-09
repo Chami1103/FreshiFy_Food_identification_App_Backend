@@ -1,4 +1,3 @@
-# DB_FreshiFy.py
 from __future__ import annotations
 import os
 import time
@@ -69,6 +68,7 @@ class FreshiFyDB:
         self.calendar_events: Optional[Collection] = None
         self.blogs: Optional[Collection] = None
         self.calc_records: Optional[Collection] = None
+        self.thoughts: Optional[Collection] = None  # NEW: thoughts collection
 
         # connect on init
         self._connect_with_retry(max_retries=5, wait_seconds=3)
@@ -121,6 +121,7 @@ class FreshiFyDB:
         self.calendar_events = self.db["calendar_events"]
         self.blogs = self.db["blogs"]
         self.calc_records = self.db["calc_records"]
+        self.thoughts = self.db["thoughts"]  # NEW
 
     # ---------------- setup ----------------
     def _ensure_collections_and_indexes(self) -> None:
@@ -140,7 +141,7 @@ class FreshiFyDB:
                     logging.debug(f"[DB] Collection {col} already exists (race).")
                 names.add(col)
 
-        # create collections if missing
+        # create collections if missing (added 'thoughts')
         for col in [
             "sensors_data",
             "images_data",
@@ -148,6 +149,7 @@ class FreshiFyDB:
             "calendar_events",
             "blogs",
             "calc_records",
+            "thoughts",  # NEW
         ]:
             ensure(col)
 
@@ -161,6 +163,8 @@ class FreshiFyDB:
             # calculator indexes
             self.db["calc_records"].create_index([("user", ASCENDING), ("date", DESCENDING)])
             self.db["calc_records"].create_index([("kind", ASCENDING)])
+            # thoughts index (new)
+            self.db["thoughts"].create_index([("user", ASCENDING), ("createdAt", DESCENDING)])
         except Exception as e:
             logging.warning("[DB] Warning while creating basic indexes: %s", e)
 
@@ -186,6 +190,13 @@ class FreshiFyDB:
             self.db["blogs"].create_index([("title", ASCENDING)])
             self.db["blogs"].create_index([("category", ASCENDING)])
             self.db["blogs"].create_index([("tags", ASCENDING)])
+            # optional: text index on thoughts text for later search (safe - wrapped)
+            try:
+                # create a simple text index on 'text' field to allow text searches in the future
+                self.db["thoughts"].create_index([("text", "text")], name="text_idx_thoughts")
+            except Exception:
+                # ignore text index errors (older mongo or perms)
+                logging.debug("[DB] text index for thoughts could not be created or already exists.")
         except Exception as e:
             logging.debug("[DB] Extra index creation issue: %s", e)
 
@@ -267,6 +278,54 @@ class FreshiFyDB:
         except Exception as e:
             logging.error("[DB] insert_notification failed: %s", e)
             return None
+
+    # ---------- thoughts (new) ----------
+    def add_thought(
+        self,
+        *,
+        text: str,
+        user: Optional[str] = None,
+        created_at: Optional[datetime] = None,
+    ) -> Optional[str]:
+        """
+        Inserts a short user thought/note.
+        """
+        if self.thoughts is None:
+            logging.warning("[DB] add_thought: thoughts collection missing.")
+            return None
+        doc = {
+            "user": user or self.cfg.current_user,
+            "text": text,
+            "createdAt": created_at or datetime.now(timezone.utc),
+        }
+        try:
+            res = self.thoughts.insert_one(doc)
+            return str(res.inserted_id)
+        except Exception as e:
+            logging.error("[DB] add_thought failed: %s", e)
+            return None
+
+    def list_thoughts(self, user: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """
+        Returns recent thoughts for a user ordered by createdAt descending.
+        """
+        if self.thoughts is None or self.db is None:
+            return []
+        out: List[Dict[str, Any]] = []
+        try:
+            q = {"user": user or self.cfg.current_user}
+            cur = self.thoughts.find(q).sort("createdAt", DESCENDING).limit(limit)
+            for d in cur:
+                ca = d.get("createdAt")
+                out.append({
+                    "id": str(d.get("_id")),
+                    "text": d.get("text"),
+                    "createdAt": ca.isoformat() if hasattr(ca, "isoformat") else ca,
+                })
+            return out
+        except Exception as e:
+            logging.warning("[DB] list_thoughts error: %s", e)
+            return []
 
     # ---------- reads / helpers for front-end ----------
     def get_stats(self, user: str) -> Dict[str, int]:
