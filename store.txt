@@ -1,3 +1,46 @@
+# Environment
+ENV=local
+DEBUG=False
+
+# Networking
+CORS_ORIGINS=http://192.168.8.102:19000,http://localhost:19006,http://localhost:8081
+
+SENSOR_HOST=0.0.0.0
+SENSOR_PORT=5000
+IMAGE_HOST=0.0.0.0
+IMAGE_PORT=5001
+NOTIFY_HOST=0.0.0.0
+NOTIFY_PORT=5002
+
+EXPO_PUBLIC_BACKEND_HOST=192.168.8.102
+
+# Database (MongoDB Atlas)
+MONGODB_URI=mongodb+srv://chamika:chamika@cluster0.ngoq3yd.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0
+DB_NAME=DB_FreshiFy
+CURRENT_USER=chamika
+
+# Model Paths
+MODEL_PATH=E:\FreshiFy_Mobile_App_Backend\app\models\Fruit_Classifier.h5
+SENSOR_MODEL_PATH=E:\FreshiFy_Mobile_App_Backend\app\models\logistic_regression_model.pkl
+SENSOR_SCALER_PATH=E:\FreshiFy_Mobile_App_Backend\app\models\scaler.joblib
+SENSOR_LABEL_ENCODER_PATH=E:\FreshiFy_Mobile_App_Backend\app\models\label_encoder.joblib
+
+JWT_SECRET_KEY=your-super-secret-jwt-key-change-this-in-production-12345
+
+# Uploads & Logs
+UPLOAD_DIR=E:\FreshiFy_Mobile_App_Backend\app\uploads
+LOG_LEVEL=INFO
+TTL_SECONDS=691200
+
+# Server
+USE_WAITRESS=True
+WAITRESS_THREADS=4
+
+
+
+______________________________________________________________________________________________________________________
+
+
 # E:\FreshiFy_Mobile_App_Backend\app\DB_FreshiFy.py
 from __future__ import annotations
 import os
@@ -36,7 +79,6 @@ class FreshifyConfig:
     mongo_uri: str = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
     db_name: str = os.getenv("DB_NAME", "DB_FreshiFy")
     ttl_seconds: int = int(os.getenv("TTL_SECONDS", str(8 * 24 * 60 * 60)))  # default 8 days
-    ttl_one_month: int = int(os.getenv("TTL_ONE_MONTH", str(30 * 24 * 60 * 60)))  # 30 days
     current_user: str = os.getenv("CURRENT_USER", "chamika")
     ts_time_field: str = "createdAt"
     ts_meta_field: str = "user"
@@ -71,7 +113,7 @@ class FreshiFyDB:
         self.blogs: Optional[Collection] = None
         self.calc_records: Optional[Collection] = None
         self.thoughts: Optional[Collection] = None
-        self.users: Optional[Collection] = None
+        self.users: Optional[Collection] = None  # NEW: users collection for auth
 
         # connect on init
         self._connect_with_retry(max_retries=5, wait_seconds=3)
@@ -80,7 +122,6 @@ class FreshiFyDB:
         if self.db is not None:
             try:
                 self._ensure_collections_and_indexes()
-                self._ensure_one_month_ttl()  # NEW: Add 1-month TTL
                 self._cache_collections()
                 logging.info(f"[DB] Connected to {self.cfg.mongo_uri}, DB={self.cfg.db_name}")
             except Exception as e:
@@ -112,6 +153,7 @@ class FreshiFyDB:
 
         # if we reach here, connection failed
         logging.error("[DB] Connection failed after retries.")
+        # keep client/db as None to allow graceful degradation in the rest of the code
         self.client = None
         self.db = None
 
@@ -125,7 +167,7 @@ class FreshiFyDB:
         self.blogs = self.db["blogs"]
         self.calc_records = self.db["calc_records"]
         self.thoughts = self.db["thoughts"]
-        self.users = self.db["users"]
+        self.users = self.db["users"]  # NEW: cache users collection
 
     # ---------------- setup ----------------
     def _ensure_collections_and_indexes(self) -> None:
@@ -145,7 +187,7 @@ class FreshiFyDB:
                     logging.debug(f"[DB] Collection {col} already exists (race).")
                 names.add(col)
 
-        # create collections if missing
+        # create collections if missing (added 'users')
         for col in [
             "sensors_data",
             "images_data",
@@ -154,7 +196,7 @@ class FreshiFyDB:
             "blogs",
             "calc_records",
             "thoughts",
-            "users",
+            "users",  # NEW: users collection
         ]:
             ensure(col)
 
@@ -165,15 +207,18 @@ class FreshiFyDB:
             self.db["notifications"].create_index([("user", ASCENDING), ("createdAt", DESCENDING)])
             self.db["calendar_events"].create_index([("user", ASCENDING), ("start", DESCENDING)])
             self.db["blogs"].create_index([("user", ASCENDING), ("createdAt", DESCENDING)])
+            # calculator indexes
             self.db["calc_records"].create_index([("user", ASCENDING), ("date", DESCENDING)])
             self.db["calc_records"].create_index([("kind", ASCENDING)])
+            # thoughts index
             self.db["thoughts"].create_index([("user", ASCENDING), ("createdAt", DESCENDING)])
+            # users indexes (NEW)
             self.db["users"].create_index([("email", ASCENDING)], unique=True)
             self.db["users"].create_index([("createdAt", DESCENDING)])
         except Exception as e:
             logging.warning("[DB] Warning while creating basic indexes: %s", e)
 
-        # telemetry-specific TTL (8 days for sensors/images)
+        # telemetry-specific TTL (only for telemetry collections)
         try:
             self.db["sensors_data"].create_index(
                 [("createdAt", ASCENDING)],
@@ -195,69 +240,15 @@ class FreshiFyDB:
             self.db["blogs"].create_index([("title", ASCENDING)])
             self.db["blogs"].create_index([("category", ASCENDING)])
             self.db["blogs"].create_index([("tags", ASCENDING)])
+            # optional: text index on thoughts text for later search (safe - wrapped)
             try:
+                # create a simple text index on 'text' field to allow text searches in the future
                 self.db["thoughts"].create_index([("text", "text")], name="text_idx_thoughts")
             except Exception:
+                # ignore text index errors (older mongo or perms)
                 logging.debug("[DB] text index for thoughts could not be created or already exists.")
         except Exception as e:
             logging.debug("[DB] Extra index creation issue: %s", e)
-
-    # ---------------- NEW: 1-month TTL for additional collections ----------------
-    def _ensure_one_month_ttl(self) -> None:
-        """
-        Adds 1-month (30 days) TTL to notifications, calendar_events, thoughts, calc_records, and blogs.
-        This ensures old data is automatically cleaned up after 30 days.
-        """
-        if self.db is None:
-            logging.warning("[DB] _ensure_one_month_ttl called but no database connection.")
-            return
-        
-        one_month_seconds = self.cfg.ttl_one_month
-        
-        try:
-            # TTL for notifications (1 month)
-            self.db["notifications"].create_index(
-                [("createdAt", ASCENDING)],
-                expireAfterSeconds=one_month_seconds,
-                name="ttl_createdAt_notifications"
-            )
-            logging.info("[DB] 1-month TTL created for notifications")
-            
-            # TTL for calendar events (1 month)
-            self.db["calendar_events"].create_index(
-                [("createdAt", ASCENDING)],
-                expireAfterSeconds=one_month_seconds,
-                name="ttl_createdAt_calendar"
-            )
-            logging.info("[DB] 1-month TTL created for calendar_events")
-            
-            # TTL for thoughts (1 month)
-            self.db["thoughts"].create_index(
-                [("createdAt", ASCENDING)],
-                expireAfterSeconds=one_month_seconds,
-                name="ttl_createdAt_thoughts"
-            )
-            logging.info("[DB] 1-month TTL created for thoughts")
-            
-            # TTL for calculator records (1 month)
-            self.db["calc_records"].create_index(
-                [("createdAt", ASCENDING)],
-                expireAfterSeconds=one_month_seconds,
-                name="ttl_createdAt_calc"
-            )
-            logging.info("[DB] 1-month TTL created for calc_records")
-            
-            # TTL for blogs (1 month)
-            self.db["blogs"].create_index(
-                [("createdAt", ASCENDING)],
-                expireAfterSeconds=one_month_seconds,
-                name="ttl_createdAt_blogs"
-            )
-            logging.info("[DB] 1-month TTL created for blogs")
-            
-            logging.info("[DB] All 1-month TTL indexes created successfully")
-        except Exception as e:
-            logging.warning("[DB] 1-month TTL index creation warning: %s", e)
 
     # ---------------- inserts ----------------
     def insert_sensor_result(
@@ -386,7 +377,7 @@ class FreshiFyDB:
             logging.warning("[DB] list_thoughts error: %s", e)
             return []
 
-    # ---------- users ----------
+    # ---------- users (NEW) ----------
     def get_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
         """Get user by email"""
         if self.users is None:
@@ -542,91 +533,6 @@ class FreshiFyDB:
         except Exception as e:
             logging.warning("[DB] get_history error: %s", e)
             return []
-
-    # ---------- NEW: Food waste breakdown ----------
-    def get_food_waste_breakdown(self, user: str, days: int = 30) -> Dict[str, Any]:
-        """
-        Returns breakdown of detected foods (both fresh and spoiled) over the last N days.
-        Useful for cost tracking and waste analysis.
-        """
-        if self.db is None:
-            return {"items": [], "totalItems": 0, "freshItems": 0, "spoiledItems": 0}
-        
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        
-        try:
-            # Aggregate from both sensors and images
-            pipeline = [
-                {"$match": {"user": user, "createdAt": {"$gte": cutoff}}},
-                {"$group": {
-                    "_id": {"food": "$food", "status": "$status"},
-                    "count": {"$sum": 1},
-                    "latestDate": {"$max": "$createdAt"}
-                }},
-                {"$sort": {"latestDate": -1}}
-            ]
-            
-            sensor_results = list(self.db["sensors_data"].aggregate(pipeline))
-            image_results = list(self.db["images_data"].aggregate(pipeline))
-            
-            # Combine results
-            all_results = sensor_results + image_results
-            
-            # Process into structured format
-            food_map: Dict[str, Dict[str, Any]] = {}
-            total_fresh = 0
-            total_spoiled = 0
-            
-            for item in all_results:
-                food_name = item["_id"].get("food") or "Unknown"
-                status = item["_id"].get("status") or "Unknown"
-                count = item.get("count", 0)
-                
-                if food_name not in food_map:
-                    food_map[food_name] = {
-                        "food": food_name,
-                        "fresh": 0,
-                        "spoiled": 0,
-                        "total": 0,
-                        "latestDate": item.get("latestDate")
-                    }
-                
-                if status.lower() == "fresh":
-                    food_map[food_name]["fresh"] += count
-                    total_fresh += count
-                elif status.lower() == "spoiled":
-                    food_map[food_name]["spoiled"] += count
-                    total_spoiled += count
-                
-                food_map[food_name]["total"] += count
-                
-                # Update latest date
-                latest = item.get("latestDate")
-                if latest and food_map[food_name]["latestDate"]:
-                    if latest > food_map[food_name]["latestDate"]:
-                        food_map[food_name]["latestDate"] = latest
-            
-            # Convert to list and format dates
-            items_list = []
-            for food_data in food_map.values():
-                ld = food_data.get("latestDate")
-                food_data["latestDate"] = ld.isoformat() if hasattr(ld, "isoformat") else ld
-                items_list.append(food_data)
-            
-            # Sort by total count descending
-            items_list.sort(key=lambda x: x["total"], reverse=True)
-            
-            return {
-                "items": items_list,
-                "totalItems": total_fresh + total_spoiled,
-                "freshItems": total_fresh,
-                "spoiledItems": total_spoiled,
-                "periodDays": days
-            }
-            
-        except Exception as e:
-            logging.warning("[DB] get_food_waste_breakdown error: %s", e)
-            return {"items": [], "totalItems": 0, "freshItems": 0, "spoiledItems": 0}
 
     # ---------- calendar ----------
     def add_calendar_event(
@@ -806,173 +712,106 @@ class FreshiFyDB:
         except Exception as e:
             logging.warning("[DB] delete_blog error: %s", e)
             return False
-# ---------- calculator (records + summary) ----------
-def add_calc_record(
-    self,
-    *,
-    user: str,
-    food: str,
-    value: float,
-    kind: str,  # "entry" | "bonus"
-    date_iso: str,
-) -> Optional[str]:
-    if self.calc_records is None:
-        logging.warning("[DB] add_calc_record: calc_records missing.")
-        return None
-    try:
-        when = datetime.fromisoformat(date_iso.replace("Z", "+00:00"))
-    except Exception:
-        when = datetime.now(timezone.utc)
-    doc = {
-        "user": user or self.cfg.current_user,
-        "food": food,
-        "value": float(value),
-        "kind": kind if kind in ("entry", "bonus") else "entry",
-        "date": when,
-        "createdAt": datetime.now(timezone.utc),
-    }
-    try:
-        res = self.calc_records.insert_one(doc)
-        return str(res.inserted_id)
-    except Exception as e:
-        logging.error("[DB] add_calc_record failed: %s", e)
-        return None
 
-def calc_summary(self, *, user: str) -> Dict[str, Any]:
-    """
-    Returns a month-to-date summary for the given user.
-    """
-    if self.calc_records is None:
-        return {
-            "latestFood": None,
-            "currentTotalCost": 0,
-            "totalBonus": 0,
-            "netAmount": 0,
-            "lastUpdatedDate": None,
-            "monthStartDate": None,
-            "billPrintedDate": None,
-            "remainingDays": None,
+    # ---------- calculator (records + summary) ----------
+    def add_calc_record(
+        self,
+        *,
+        user: str,
+        food: str,
+        value: float,
+        kind: str,  # "entry" | "bonus"
+        date_iso: str,
+    ) -> Optional[str]:
+        if self.calc_records is None:
+            logging.warning("[DB] add_calc_record: calc_records missing.")
+            return None
+        try:
+            when = datetime.fromisoformat(date_iso.replace("Z", "+00:00"))
+        except Exception:
+            when = datetime.now(timezone.utc)
+        doc = {
+            "user": user or self.cfg.current_user,
+            "food": food,
+            "value": float(value),
+            "kind": kind if kind in ("entry", "bonus") else "entry",
+            "date": when,
+            "createdAt": datetime.now(timezone.utc),
         }
+        try:
+            res = self.calc_records.insert_one(doc)
+            return str(res.inserted_id)
+        except Exception as e:
+            logging.error("[DB] add_calc_record failed: %s", e)
+            return None
 
-    now = datetime.now(timezone.utc)
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    # first day of next month
-    if month_start.month == 12:
-        next_month_start = month_start.replace(year=month_start.year + 1, month=1)
-    else:
-        next_month_start = month_start.replace(month=month_start.month + 1)
+    def calc_summary(self, *, user: str) -> Dict[str, Any]:
+        """
+        Returns a month-to-date summary for the given user.
+        """
+        if self.calc_records is None:
+            return {
+                "latestFood": None,
+                "currentTotalCost": 0,
+                "totalBonus": 0,
+                "netAmount": 0,
+                "lastUpdatedDate": None,
+                "monthStartDate": None,
+                "billPrintedDate": None,
+                "remainingDays": None,
+            }
 
-    try:
-        cur = self.calc_records.find(
-            {"user": user, "date": {"$gte": month_start, "$lt": next_month_start}}
-        ).sort("date", DESCENDING)
-    except Exception as e:
-        logging.warning("[DB] calc_summary find error: %s", e)
+        now = datetime.now(timezone.utc)
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        # first day of next month
+        if month_start.month == 12:
+            next_month_start = month_start.replace(year=month_start.year + 1, month=1)
+        else:
+            next_month_start = month_start.replace(month=month_start.month + 1)
+
+        try:
+            cur = self.calc_records.find(
+                {"user": user, "date": {"$gte": month_start, "$lt": next_month_start}}
+            ).sort("date", DESCENDING)
+        except Exception as e:
+            logging.warning("[DB] calc_summary find error: %s", e)
+            return {
+                "latestFood": None,
+                "currentTotalCost": 0,
+                "totalBonus": 0,
+                "netAmount": 0,
+                "lastUpdatedDate": None,
+                "monthStartDate": month_start.isoformat(),
+                "billPrintedDate": None,
+                "remainingDays": (next_month_start.date() - now.date()).days,
+            }
+
+        entry_total = 0.0
+        bonus_total = 0.0
+        latest_food = None
+        last_updated = None
+
+        for i, d in enumerate(cur):
+            v = float(d.get("value", 0) or 0)
+            if d.get("kind") == "bonus":
+                bonus_total += v
+            else:
+                entry_total += v
+            if i == 0:
+                latest_food = d.get("food")
+                when = d.get("date") or d.get("createdAt")
+                last_updated = when.isoformat() if hasattr(when, "isoformat") else when
+
+        net = entry_total + bonus_total
+        remaining_days = (next_month_start.date() - now.date()).days
+
         return {
-            "latestFood": None,
-            "currentTotalCost": 0,
-            "totalBonus": 0,
-            "netAmount": 0,
-            "lastUpdatedDate": None,
+            "latestFood": latest_food,
+            "currentTotalCost": round(entry_total, 2),
+            "totalBonus": round(bonus_total, 2),
+            "netAmount": round(net, 2),
+            "lastUpdatedDate": last_updated,
             "monthStartDate": month_start.isoformat(),
             "billPrintedDate": None,
-            "remainingDays": (next_month_start.date() - now.date()).days,
+            "remainingDays": remaining_days,
         }
-
-    entry_total = 0.0
-    bonus_total = 0.0
-    latest_food = None
-    last_updated = None
-
-    for i, d in enumerate(cur):
-        v = float(d.get("value", 0) or 0)
-        if d.get("kind") == "bonus":
-            bonus_total += v
-        else:
-            entry_total += v
-        if i == 0:
-            latest_food = d.get("food")
-            when = d.get("date") or d.get("createdAt")
-            last_updated = when.isoformat() if hasattr(when, "isoformat") else when
-
-    net = entry_total + bonus_total
-    remaining_days = (next_month_start.date() - now.date()).days
-
-    return {
-        "latestFood": latest_food,
-        "currentTotalCost": round(entry_total, 2),
-        "totalBonus": round(bonus_total, 2),
-        "netAmount": round(net, 2),
-        "lastUpdatedDate": last_updated,
-        "monthStartDate": month_start.isoformat(),
-        "billPrintedDate": None,
-        "remainingDays": remaining_days,
-    }
-
-# ---------- NEW: Enhanced calculator summary ----------
-def calc_summary_enhanced(self, *, user: str) -> Dict[str, Any]:
-    """
-    Enhanced calculator summary that includes:
-    - Monthly cost breakdown
-    - Food item details with costs
-    - Top 5 most expensive items
-    - Waste percentage
-    """
-    base_summary = self.calc_summary(user=user)
-    
-    if self.calc_records is None:
-        return base_summary
-    
-    now = datetime.now(timezone.utc)
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    
-    if month_start.month == 12:
-        next_month_start = month_start.replace(year=month_start.year + 1, month=1)
-    else:
-        next_month_start = month_start.replace(month=month_start.month + 1)
-    
-    try:
-        # Get all records for this month
-        records = list(self.calc_records.find({
-            "user": user,
-            "date": {"$gte": month_start, "$lt": next_month_start}
-        }).sort("date", DESCENDING))
-        
-        # Group by food item
-        food_costs: Dict[str, float] = {}
-        for rec in records:
-            food = rec.get("food", "Unknown")
-            value = float(rec.get("value", 0) or 0)
-            kind = rec.get("kind", "entry")
-            
-            if kind == "entry":  # Only count costs, not bonuses
-                food_costs[food] = food_costs.get(food, 0.0) + value
-        
-        # Get top 5 most expensive items
-        top_items = sorted(
-            [{"food": k, "cost": round(v, 2)} for k, v in food_costs.items()],
-            key=lambda x: x["cost"],
-            reverse=True
-        )[:5]
-        
-        # Get waste stats from detection
-        waste_stats = self.get_food_waste_breakdown(user=user, days=30)
-        total_scans = waste_stats.get("totalItems", 0)
-        spoiled = waste_stats.get("spoiledItems", 0)
-        waste_percentage = round((spoiled / total_scans * 100) if total_scans > 0 else 0, 1)
-        
-        # Enhance base summary
-        base_summary.update({
-            "topExpensiveItems": top_items,
-            "totalUniqueItems": len(food_costs),
-            "wastePercentage": waste_percentage,
-            "totalScans": total_scans,
-            "spoiledScans": spoiled,
-            "foodBreakdown": waste_stats.get("items", [])[:10]  # Top 10 foods
-        })
-        
-        return base_summary
-        
-    except Exception as e:
-        logging.warning("[DB] calc_summary_enhanced error: %s", e)
-        return base_summary

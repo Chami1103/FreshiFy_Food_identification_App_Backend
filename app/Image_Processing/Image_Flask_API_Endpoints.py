@@ -1,4 +1,4 @@
-# File: Image_Processing/Image_Flask_API_Endpoints.py
+# File: app/Image_Processing/Image_Flask_API_Endpoints.py
 """
 Image FreshiFy Backend (configurable port)
 Endpoints:
@@ -20,12 +20,13 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 
-# ensure backend root is on path
-BACKEND_ROOT = pathlib.Path(__file__).resolve().parents[1]
+# Ensure backend root is on path
+BACKEND_ROOT = pathlib.Path(__file__).resolve().parents[2]  # Go up 2 levels to reach backend root
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from DB_FreshiFy import FreshiFyDB, FreshifyConfig
+# Import from app package
+from app.DB_FreshiFy import FreshiFyDB, FreshifyConfig
 
 load_dotenv()
 app = Flask(__name__)
@@ -43,11 +44,14 @@ CORS(
 cfg = FreshifyConfig()
 db = FreshiFyDB(cfg)
 
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", os.path.join(os.getcwd(), "uploads"))
+# Upload directory
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", os.path.join(BACKEND_ROOT, "uploads"))
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".bmp"}
 
-MODEL_PATH = os.getenv("MODEL_PATH", os.path.join(os.getcwd(), "models", "Fruit_Classifier.h5"))
+# Model path
+MODELS_DIR = os.path.join(BACKEND_ROOT, "models")
+MODEL_PATH = os.getenv("MODEL_PATH", os.path.join(MODELS_DIR, "Fruit_Classifier.h5"))
 
 image_model = None
 _tf_loaded = False
@@ -76,13 +80,13 @@ try:
     if os.path.exists(MODEL_PATH):
         image_model = tf.keras.models.load_model(MODEL_PATH)
         _tf_loaded = True
-        app.logger.info("[MODEL] Loaded TensorFlow model from %s", MODEL_PATH)
+        app.logger.info(f"[MODEL] ✅ Loaded TensorFlow model from {MODEL_PATH}")
     else:
         warnings.warn(f"[MODEL] Fruit_Classifier not found at {MODEL_PATH}")
-        app.logger.warning("[MODEL] Model file not found at %s", MODEL_PATH)
+        app.logger.warning(f"[MODEL] ⚠️ Model file not found at {MODEL_PATH}")
 except Exception as e:
     warnings.warn(f"[MODEL] TensorFlow load failed: {e}")
-    app.logger.warning("[MODEL] TensorFlow not available: %s", e)
+    app.logger.warning(f"[MODEL] ⚠️ TensorFlow not available: {e}")
     image_model = None
     _tf_loaded = False
 
@@ -92,7 +96,7 @@ def _now_str() -> str:
 
 
 def _predict_fallback(filename: str) -> Dict[str, Any]:
-    # lightweight fallback if TF not available
+    """Lightweight fallback if TF not available"""
     lower = filename.lower()
     if "apple" in lower:
         return {"food": "Apple", "status": "Fresh", "confidence": 0.75}
@@ -104,6 +108,7 @@ def _predict_fallback(filename: str) -> Dict[str, Any]:
 
 
 def _predict_with_model(path: str) -> Dict[str, Any]:
+    """Predict using TensorFlow model"""
     if not _tf_loaded or image_model is None:
         return _predict_fallback(path)
     try:
@@ -121,7 +126,7 @@ def _predict_with_model(path: str) -> Dict[str, Any]:
         confidence = float(np.max(preds[0])) if hasattr(preds, "shape") else 0.0
         return {"food": food, "status": status, "confidence": round(confidence, 3)}
     except Exception as e:
-        app.logger.warning("[MODEL] Prediction error: %s", e)
+        app.logger.warning(f"[MODEL] Prediction error: {e}")
         return _predict_fallback(path)
 
 
@@ -129,9 +134,12 @@ def _predict_with_model(path: str) -> Dict[str, Any]:
 def health():
     return jsonify({
         "ok": True,
+        "service": "Image Service",
+        "version": "1.0.0",
         "model_loaded": _tf_loaded,
         "db_connected": db.db is not None,
         "uploads": os.path.isdir(UPLOAD_DIR),
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }), 200
 
 
@@ -161,6 +169,7 @@ def predict_image():
 
     results: List[Dict[str, Any]] = []
     predictions: List[str] = []
+    
     for f in files:
         orig_name = f.filename or f"img_{uuid.uuid4().hex}.jpg"
         ext = pathlib.Path(orig_name).suffix.lower()
@@ -168,10 +177,11 @@ def predict_image():
             ext = ".jpg"
         fname = secure_filename(f"{uuid.uuid4().hex}{ext}")
         path = os.path.join(UPLOAD_DIR, fname)
+        
         try:
             f.save(path)
         except Exception as e:
-            app.logger.warning("[UPLOAD] Save failed for %s: %s", orig_name, e)
+            app.logger.warning(f"[UPLOAD] Save failed for {orig_name}: {e}")
             continue
 
         pred = _predict_with_model(path)
@@ -190,7 +200,7 @@ def predict_image():
                 created_at=datetime.now(timezone.utc),
             )
         except Exception as e:
-            app.logger.warning("[DB] insert_image_result failed: %s", e)
+            app.logger.warning(f"[DB] insert_image_result failed: {e}")
 
         results.append({
             "file": fname,
@@ -242,6 +252,18 @@ def history():
 if __name__ == "__main__":
     port = int(os.getenv("IMAGE_PORT", "5001"))
     host = os.getenv("IMAGE_HOST", "0.0.0.0")
+    debug = os.getenv("DEBUG", "False").lower() == "true"
+    
+    print("=" * 70)
+    print("🖼️  FreshiFy Image Service")
+    print("=" * 70)
+    print(f"📍 Starting on: http://{host}:{port}")
+    print(f"🔧 Debug mode: {debug}")
+    print(f"🤖 Model loaded: {_tf_loaded}")
+    print(f"🗄️  Database: {cfg.db_name}")
+    print(f"📁 Upload dir: {UPLOAD_DIR}")
+    print("=" * 70)
+    
     app.logger.info("[IMAGE] starting on %s:%s tf_loaded=%s db_connected=%s",
                     host, port, _tf_loaded, db.db is not None)
-    app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
+    app.run(host=host, port=port, debug=debug, use_reloader=False, threaded=True)

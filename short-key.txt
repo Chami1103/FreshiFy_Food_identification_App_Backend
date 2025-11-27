@@ -1,0 +1,4 @@
+check your structure : tree /F app
+remote repo URL : git remote get-url origin
+show  branch : git rev-parse --abbrev-ref HEAD
+

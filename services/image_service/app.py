@@ -4,7 +4,7 @@ Image Detection Service - FreshiFy
 Classifies food freshness from images using MobileNetV2.
 Port: 5001
 """
-
+#E:\FreshiFy_Mobile_App_Backend\services\image_service\app.py
 import os
 import uuid
 import pathlib

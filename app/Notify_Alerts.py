@@ -2,7 +2,7 @@
 Notify_Alerts.py — Notification / Calendar / Blog / Calculator Backend (configurable port)
 Uses FreshiFyDB for persistence and prefers waitress if installed.
 """
-
+#E:\FreshiFy_Mobile_App_Backend\app\Notify_Alerts.py
 import os
 import signal
 import logging
@@ -109,7 +109,7 @@ def health():
     return jsonify({
         "status": "ok" if db_ok else "degraded",
         "service": "notify_calendar_blog",
-        "version": "v1.0",
+        "version": "v1.1",
         "db_connected": db_ok,
     }), 200
 
@@ -339,11 +339,61 @@ def calculator_add():
 
 @app.get("/calculator/summary")
 def calculator_summary():
+    """
+    Basic calculator summary endpoint (backward compatible).
+    """
     try:
         summary = db.calc_summary(user=cfg.current_user)
         return jsonify(summary), 200
     except Exception:
         logger.warning("[CALC] Summary error")
+        raise
+
+
+# ------------------------------------------------------------
+# NEW: Enhanced Calculator Endpoints
+# ------------------------------------------------------------
+@app.get("/calculator/summary-enhanced")
+def calculator_summary_enhanced():
+    """
+    Enhanced calculator summary with food details and waste stats.
+    
+    Returns:
+    - Basic monthly summary (cost, bonus, net amount, days remaining)
+    - Top 5 most expensive food items
+    - Total unique items tracked
+    - Waste percentage and stats
+    - Food-by-food breakdown (fresh vs spoiled)
+    """
+    try:
+        summary = db.calc_summary_enhanced(user=cfg.current_user)
+        logger.info("[CALC] Enhanced summary retrieved for user=%s", cfg.current_user)
+        return jsonify(summary), 200
+    except Exception:
+        logger.exception("[CALC] Enhanced summary error")
+        raise
+
+
+@app.get("/calculator/food-breakdown")
+def calculator_food_breakdown():
+    """
+    Get breakdown of detected foods over the last N days.
+    
+    Query params:
+      - days (optional, default=30, max=365)
+    
+    Returns:
+    - List of food items with fresh/spoiled/total counts
+    - Overall totals and statistics
+    - Period information
+    """
+    days = min(int(request.args.get("days", 30)), 365)
+    try:
+        breakdown = db.get_food_waste_breakdown(user=cfg.current_user, days=days)
+        logger.info("[CALC] Food breakdown retrieved for user=%s, days=%d", cfg.current_user, days)
+        return jsonify(breakdown), 200
+    except Exception:
+        logger.exception("[CALC] Food breakdown error")
         raise
 
 
